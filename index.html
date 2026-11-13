@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recorder Challenge</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:940px;margin:24px auto;padding:0 16px;color:#222}
+  h1{margin:0 0 4px} .sub{color:#666;margin:0 0 16px}
+  #live{font-size:28px;font-weight:600;height:40px}
+  #big{font-size:48px;text-align:center;height:60px;font-weight:700}
+  canvas{width:100%;border:1px solid #ccc;border-radius:8px;background:#fafafa}
+  .ctl{display:flex;flex-wrap:wrap;gap:20px;align-items:center;margin:14px 0}
+  .ctl label{font-size:14px} button{font-size:18px;padding:10px 22px;border-radius:8px;border:0;background:#2563eb;color:#fff;cursor:pointer}
+  #result{margin-top:16px} .win{font-size:40px;color:#16a34a;font-weight:800}
+  .lose{font-size:28px;color:#b91c1c;font-weight:700}
+  table{border-collapse:collapse;margin-top:10px;font-size:14px} td,th{border:1px solid #ddd;padding:4px 10px;text-align:left}
+  .ok{color:#16a34a}.bad{color:#b91c1c}
+</style>
+</head>
+<body>
+<h1>🎶 Recorder Challenge</h1>
+<p class="sub" id="title"></p>
+<div id="live">Press Start</div>
+<div id="big"></div>
+<canvas id="c" width="900" height="300"></canvas>
+<div class="ctl">
+  <button id="start">Start</button>
+  <label>Pitch tolerance ±<span id="pv">40</span> cents<br><input type="range" id="pitch" min="10" max="100" value="40"></label>
+  <label>Timing tolerance ±<span id="tv">0.25</span> beat<br><input type="range" id="timing" min="0.05" max="0.5" step="0.05" value="0.25"></label>
+  <label>Mic sensitivity (lower = more sensitive)<br><input type="range" id="thr" min="0.003" max="0.05" step="0.001" value="0.015"></label>
+  <label><input type="checkbox" id="click"> Audible metronome (use headphones)</label>
+</div>
+<div id="result"></div>
+
+<script>
+// ====== EDIT THIS: the song the player must perform ======
+// Each note: [name, startBeat, lengthInBeats]. Beat 0 is the first beat of the first measure.
+// transpose: semitones added to every note (12 = up one octave). The sheet music sits at C4-D5,
+// which is below a recorder's range, so it is shifted up an octave (soprano C5-D7, alto F4-G6).
+const SONG = {
+  title: "Defying Gravity (\"It's time to\" to \"down\")",
+  bpm: 90,
+  countIn: 4,
+  transpose: 12,
+  notes: [
+    // m17 "It's time to" (quarter rest first)
+    ["G4",1,1],["G4",2,1],["D5",3,1],
+    // m18 "try de-"
+    ["C5",4,3],["E4",7,1],
+    // m19 "fy-ing"
+    ["G4",8,3],["C4",11,1],
+    // m20-21 "grav-i-ty" (D4 tied across the barline: 2 + 1 beats)
+    ["E4",12,1.5],["D4",13.5,0.5],["D4",14,3],
+    ["G4",17,1],["G4",18,1],["D5",19,1],
+    // m22 "try de-"
+    ["C5",20,3],["E4",23,1],
+    // m23 "fy-ing"
+    ["G4",24,3],["C5",27,1],
+    // m24 "grav-i-ty and"
+    ["E4",28,1.5],["D4",29.5,0.5],["D4",30,1],["C4",31,1],
+    // m25 "you can't pull me"
+    ["F4",32,1],["E4",33,1],["D4",34,1],["C4",35,1],
+    // m26 "down"
+    ["C4",36,2]
+  ]
+};
+// =========================================================
+
+const NAMES=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const parse=n=>{const m=/^([A-G])(#|b)?(-?\d)$/.exec(n);return 12*(+m[3]+1)+{C:0,D:2,E:4,F:5,G:7,A:9,B:11}[m[1]]+(m[2]=='#'?1:m[2]=='b'?-1:0)};
+const midiName=m=>NAMES[m%12]+(Math.floor(m/12)-1);
+const f2m=f=>69+12*Math.log2(f/440);
+const $=id=>document.getElementById(id);
+const median=a=>{const s=[...a].sort((x,y)=>x-y);return s[Math.floor(s.length/2)]};
+const now=()=>performance.now()/1000;
+const beatDur=()=>60/SONG.bpm;
+$('title').textContent=`${SONG.title} — ${SONG.notes.length} notes at ${SONG.bpm} bpm`;
+$('pitch').oninput=e=>$('pv').textContent=e.target.value;
+$('timing').oninput=e=>$('tv').textContent=(+e.target.value).toFixed(2);
+
+let ctx,analyser,buf,state='idle',t0=0,notes,cur,pend,lastVoiced,trace,lastF;
+const TARGETS=SONG.notes.map(([n,s,l])=>{const m=parse(n)+(SONG.transpose||0);return{name:midiName(m),midi:m,s,l}});
+const endBeat=Math.max(...TARGETS.map(t=>t.s+t.l));
+const lo=Math.min(...TARGETS.map(t=>t.midi))-3, hi=Math.max(...TARGETS.map(t=>t.midi))+3;
+
+function detect(b,sr){
+  let e=0;for(let i=0;i<b.length;i++)e+=b[i]*b[i];
+  if(Math.sqrt(e/b.length)<+$('thr').value)return null;
+  const minL=Math.floor(sr/2400),maxL=Math.floor(sr/300),n=b.length-maxL-2,ns=new Float32Array(maxL+3);
+  for(let l=minL-1;l<=maxL+1;l++){let r=0,m=0;for(let i=0;i<n;i++){const a=b[i],c=b[i+l];r+=a*c;m+=a*a+c*c}ns[l]=m?2*r/m:0}
+  let best=0;for(let l=minL;l<=maxL;l++)if(ns[l]>best)best=ns[l];
+  if(best<0.85)return null;
+  for(let l=minL;l<=maxL;l++){
+    if(ns[l]>ns[l-1]&&ns[l]>=ns[l+1]&&ns[l]>=0.9*best){ // first strong peak avoids octave errors
+      const a=ns[l-1],b2=ns[l],c=ns[l+1],d=(a-c)/(2*(a-2*b2+c)||1);
+      return sr/(l+d);
+    }
+  }
+  return null;
+}
+
+// Turn a stream of pitch readings into discrete notes
+function feed(t,f){
+  if(f){
+    const m=f2m(f),r=Math.round(m);
+    trace.push([t,m]);lastVoiced=t;
+    if(cur&&cur.r===r){cur.vals.push(m);cur.end=t;pend=null}
+    else{
+      if(!pend||pend.r!==r)pend={r,t0:t-0.02,vals:[m]};else pend.vals.push(m);
+      if(pend.vals.length>=3){
+        if(cur){cur.end=Math.min(cur.end,pend.t0);notes.push(cur)}
+        cur={r,start:pend.t0,end:t,vals:pend.vals};pend=null;
+      }
+    }
+  }else if(t-lastVoiced>0.08){if(cur){notes.push(cur);cur=null}pend=null}
+}
+
+function draw(t){
+  const c=$('c'),g=c.getContext('2d'),W=c.width,H=c.height,B=beatDur();
+  const ts=t0-SONG.countIn*B,te=t0+(endBeat+1)*B;
+  const X=tt=>(tt-ts)/(te-ts)*W,Y=m=>H-(m-lo)/(hi-lo)*H,rh=H/(hi-lo);
+  g.clearRect(0,0,W,H);
+  g.font='11px system-ui';g.fillStyle='#999';g.strokeStyle='#eee';
+  for(let m=Math.ceil(lo);m<=hi;m++){g.beginPath();g.moveTo(0,Y(m));g.lineTo(W,Y(m));g.stroke();g.fillText(midiName(m),3,Y(m)-2)}
+  g.strokeStyle='#bbb';g.beginPath();g.moveTo(X(t0),0);g.lineTo(X(t0),H);g.stroke();
+  const tolB=+$('timing').value,tolC=+$('pitch').value/100;
+  for(const n of TARGETS){
+    const x=X(t0+n.s*B),w=n.l*B/(te-ts)*W;
+    g.fillStyle='rgba(37,99,235,.18)';g.fillRect(x-tolB*B/(te-ts)*W,Y(n.midi+tolC),w+2*tolB*B/(te-ts)*W,2*tolC*rh);
+    g.fillStyle='rgba(37,99,235,.65)';g.fillRect(x,Y(n.midi+0.5),w,rh);
+    g.fillStyle='#fff';g.fillText(n.name,x+4,Y(n.midi)+3);
+  }
+  g.fillStyle='#16a34a';
+  for(const [tt,m] of trace)g.fillRect(X(tt)-1,Y(m)-2,3,4);
+  if(state!=='done'){g.strokeStyle='#dc2626';g.beginPath();g.moveTo(X(t),0);g.lineTo(X(t),H);g.stroke()}
+}
+
+function loop(){
+  if(state==='idle'||state==='done')return;
+  analyser.getFloatTimeDomainData(buf);
+  const t=now(),f=detect(buf,ctx.sampleRate);
+  feed(t,f);
+  $('live').textContent=f?(()=>{const m=f2m(f);return `${midiName(Math.round(m))}  (${(m-Math.round(m))*100>=0?'+':''}${Math.round((m-Math.round(m))*100)} cents)`})():'—';
+  const B=beatDur();
+  if(t<t0){$('big').textContent=Math.ceil((t0-t)/B)}
+  else{state='play';$('big').textContent='Play!'}
+  draw(t);
+  if(t>t0+(endBeat+1)*B){finish();return}
+  requestAnimationFrame(loop);
+}
+
+function finish(){
+  state='done';if(cur){notes.push(cur);cur=null}
+  $('big').textContent='';$('live').textContent='Done';draw(now());
+  const B=beatDur(),tolC=+$('pitch').value,tolB=+$('timing').value,used=new Set();
+  const rows=TARGETS.map(tg=>{
+    const want=t0+tg.s*B;let bi=-1,bs=1e9;
+    notes.forEach((n,i)=>{if(used.has(i))return;const d=Math.abs(n.start-want);
+      const s=d+(n.r===tg.midi?0:B);if(d<=B&&s<bs){bs=s;bi=i}});
+    if(bi<0)return{tg,ok:false,why:'no note heard'};
+    used.add(bi);const n=notes[bi];
+    const dev=(median(n.vals)-tg.midi)*100,onset=(n.start-want)/B,dur=(n.end-n.start)/B-tg.l;
+    const pOK=Math.abs(dev)<=tolC,oOK=Math.abs(onset)<=tolB,dOK=Math.abs(dur)<=tolB*2;
+    return{tg,ok:pOK&&oOK&&dOK,dev,onset,dur,pOK,oOK,dOK,heard:midiName(n.r)};
+  });
+  const win=rows.every(r=>r.ok);
+  const f=(v,u)=>(v>=0?'+':'')+v.toFixed(u);
+  $('result').innerHTML=(win?'<div class="win">🎉 You won! 🎉</div>':'<div class="lose">Not quite — try again!</div>')+
+    '<table><tr><th>Note</th><th>Heard</th><th>Pitch</th><th>Start</th><th>Length</th></tr>'+
+    rows.map(r=>r.why?`<tr><td>${r.tg.name}</td><td colspan=4 class="bad">${r.why}</td></tr>`:
+      `<tr><td>${r.tg.name}</td><td>${r.heard}</td><td class="${r.pOK?'ok':'bad'}">${f(r.dev,0)} cents</td><td class="${r.oOK?'ok':'bad'}">${f(r.onset,2)} beat</td><td class="${r.dOK?'ok':'bad'}">${f(r.dur,2)} beat</td></tr>`).join('')+'</table>';
+  $('start').textContent='Try again';$('start').disabled=false;
+}
+
+$('start').onclick=async()=>{
+  try{
+    if(!ctx){
+      const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+      ctx=new AudioContext();analyser=ctx.createAnalyser();analyser.fftSize=2048;
+      ctx.createMediaStreamSource(stream).connect(analyser);buf=new Float32Array(analyser.fftSize);
+    }
+    if(ctx.state==='suspended')await ctx.resume();
+  }catch(e){$('live').textContent='Mic unavailable: '+e.message;return}
+  notes=[];cur=null;pend=null;lastVoiced=0;trace=[];$('result').innerHTML='';
+  const B=beatDur();t0=now()+SONG.countIn*B+0.3;state='count';$('start').disabled=true;
+  if($('click').checked){
+    const base=ctx.currentTime+(t0-now());
+    for(let b=-SONG.countIn;b<=endBeat;b++){
+      const o=ctx.createOscillator(),g=ctx.createGain();o.frequency.value=b<0?880:660;
+      g.gain.setValueAtTime(.2,base+b*B);g.gain.exponentialRampToValueAtTime(.001,base+b*B+.06);
+      o.connect(g).connect(ctx.destination);o.start(base+b*B);o.stop(base+b*B+.07);
+    }
+  }
+  loop();
+};
+t0=now()+SONG.countIn*beatDur();trace=[];draw(t0-SONG.countIn*beatDur());
+</script>
+</body>
+</html>
