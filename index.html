@@ -21,10 +21,11 @@
 <body>
 <h1>🎶 Recorder Challenge</h1>
 <p class="sub" id="title"></p>
-<div id="live">Press Start</div>
+<div id="live">Press Preview to hear the song, then Start when you're ready</div>
 <div id="big"></div>
 <canvas id="c" width="900" height="300"></canvas>
 <div class="ctl">
+  <button id="preview" style="background:#7c3aed">▶ Preview</button>
   <button id="start">Start</button>
   <label>Pitch tolerance ±<span id="pv">40</span> cents<br><input type="range" id="pitch" min="10" max="100" value="40"></label>
   <label>Timing tolerance ±<span id="tv">0.25</span> beat<br><input type="range" id="timing" min="0.05" max="0.5" step="0.05" value="0.25"></label>
@@ -170,8 +171,38 @@ function finish(){
     '<table><tr><th>Note</th><th>Heard</th><th>Pitch</th><th>Start</th><th>Length</th></tr>'+
     rows.map(r=>r.why?`<tr><td>${r.tg.name}</td><td colspan=4 class="bad">${r.why}</td></tr>`:
       `<tr><td>${r.tg.name}</td><td>${r.heard}</td><td class="${r.pOK?'ok':'bad'}">${f(r.dev,0)} cents</td><td class="${r.oOK?'ok':'bad'}">${f(r.onset,2)} beat</td><td class="${r.dOK?'ok':'bad'}">${f(r.dur,2)} beat</td></tr>`).join('')+'</table>';
-  $('start').textContent='Try again';$('start').disabled=false;
+  $('start').textContent='Try again';$('start').disabled=false;$('preview').disabled=false;
 }
+
+let pctx;
+$('preview').onclick=()=>{
+  if(!pctx)pctx=new AudioContext();
+  pctx.resume();
+  const B=beatDur();
+  trace=[];$('result').innerHTML='';$('live').textContent='Preview: just listen';
+  state='preview';$('preview').disabled=true;$('start').disabled=true;
+  t0=now()+SONG.countIn*B+0.15;
+  const base=pctx.currentTime+(t0-now());
+  const tone=(freq,at,dur,vol,type)=>{
+    const o=pctx.createOscillator(),g=pctx.createGain();o.type=type;o.frequency.value=freq;
+    g.gain.setValueAtTime(0.0001,at);g.gain.linearRampToValueAtTime(vol,at+0.03);
+    g.gain.setValueAtTime(vol,at+Math.max(0.03,dur-0.05));g.gain.linearRampToValueAtTime(0.0001,at+dur);
+    o.connect(g).connect(pctx.destination);o.start(at);o.stop(at+dur+0.02);
+  };
+  for(let b=-SONG.countIn;b<0;b++)tone(880,base+b*B,0.06,0.12,'sine'); // count-in ticks
+  for(const n of TARGETS)tone(440*Math.pow(2,(n.midi-69)/12),base+n.s*B,n.l*B-0.04,0.3,'triangle');
+  (function pl(){
+    const t=now();
+    $('big').textContent=t<t0?Math.ceil((t0-t)/B):'♪';
+    draw(t);
+    if(t>t0+(endBeat+1)*B){
+      state='idle';$('big').textContent='';$('live').textContent='Press Start when you\'re ready';
+      $('preview').disabled=false;$('start').disabled=false;
+      t0=now()+SONG.countIn*B;draw(t0-SONG.countIn*B);return;
+    }
+    requestAnimationFrame(pl);
+  })();
+};
 
 $('start').onclick=async()=>{
   try{
@@ -183,7 +214,7 @@ $('start').onclick=async()=>{
     if(ctx.state==='suspended')await ctx.resume();
   }catch(e){$('live').textContent='Mic unavailable: '+e.message;return}
   notes=[];cur=null;pend=null;lastVoiced=0;trace=[];$('result').innerHTML='';
-  const B=beatDur();t0=now()+SONG.countIn*B+0.3;state='count';$('start').disabled=true;
+  const B=beatDur();t0=now()+SONG.countIn*B+0.3;state='count';$('start').disabled=true;$('preview').disabled=true;
   if($('click').checked){
     const base=ctx.currentTime+(t0-now());
     for(let b=-SONG.countIn;b<=endBeat;b++){
